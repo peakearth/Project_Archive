@@ -50,77 +50,137 @@ class KBODataScraper:
     def setup_driver(self):
         """Selenium WebDriver 설정"""
         chrome_options = Options()
-        chrome_options.add_argument('--headless')  # 브라우저 창 숨기기
+        # 더 안정적인 Chrome 옵션 설정
+        chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-web-security')
+        chrome_options.add_argument('--disable-features=VizDisplayCompositor')
         chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         
         try:
-            driver = webdriver.Chrome(options=chrome_options)
+            # webdriver-manager를 사용하는 경우
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.service import Service
+            
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # 페이지 로드 타임아웃 설정
+            driver.set_page_load_timeout(30)
+            driver.implicitly_wait(10)
+            
             return driver
+            
+        except ImportError:
+            self.logger.warning("webdriver-manager가 설치되지 않음. 기본 ChromeDriver 사용")
+            try:
+                driver = webdriver.Chrome(options=chrome_options)
+                driver.set_page_load_timeout(30)
+                driver.implicitly_wait(10)
+                return driver
+            except Exception as e:
+                self.logger.error(f"기본 ChromeDriver 설정 실패: {e}")
+                return None
+                
         except Exception as e:
             self.logger.error(f"WebDriver 설정 실패: {e}")
+            # requests 방법으로 대체 시도
+            self.logger.info("Selenium 실패로 requests 방법으로 대체 시도")
             return None
     
     def get_game_data_selenium(self, year=2025, month=None):
         """Selenium을 사용한 게임 데이터 수집"""
         driver = self.setup_driver()
         if not driver:
-            return []
+            self.logger.warning("Selenium 드라이버 설정 실패. requests 방법으로 대체")
+            return self.get_game_data_requests(year)
         
         all_games = []
         
         try:
             # 현재 월부터 12월까지 또는 지정된 월만
-            start_month = month if month else datetime.now().month
-            end_month = month + 1 if month else 13
+            start_month = month if month else 3  # 시즌은 보통 3월부터
+            end_month = month + 1 if month else datetime.now().month + 1
             
             for current_month in range(start_month, end_month):
-                self.logger.info(f"{year}년 {current_month}월 데이터 수집 중...")
+                self.logger.info(f"Selenium으로 {year}년 {current_month}월 데이터 수집 중...")
                 
-                # 해당 월의 일정 페이지로 이동
-                url = f"{self.base_url}?year={year}&month={current_month:02d}"
-                driver.get(url)
-                
-                # 페이지 로딩 대기
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "tblType01"))
-                )
-                
-                # 경기 테이블 찾기
-                tables = driver.find_elements(By.CLASS_NAME, "tblType01")
-                
-                for table in tables:
-                    rows = table.find_elements(By.TAG_NAME, "tr")
+                try:
+                    # 해당 월의 일정 페이지로 이동
+                    url = f"{self.base_url}?year={year}&month={current_month:02d}"
+                    self.logger.info(f"URL 접근: {url}")
                     
-                    for row in rows[1:]:  # 헤더 제외
+                    driver.get(url)
+                    
+                    # 페이지 로딩 대기 (더 안정적인 대기)
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            EC.any_of(
+                                EC.presence_of_element_located((By.CLASS_NAME, "tblType01")),
+                                EC.presence_of_element_located((By.TAG_NAME, "table"))
+                            )
+                        )
+                    except Exception as wait_error:
+                        self.logger.warning(f"페이지 로딩 대기 실패: {wait_error}")
+                        time.sleep(5)  # 추가 대기
+                    
+                    # 경기 테이블 찾기 (여러 방법 시도)
+                    tables = driver.find_elements(By.CLASS_NAME, "tblType01")
+                    if not tables:
+                        tables = driver.find_elements(By.TAG_NAME, "table")
+                    
+                    self.logger.info(f"찾은 테이블 수: {len(tables)}")
+                    
+                    for table_idx, table in enumerate(tables):
                         try:
-                            cells = row.find_elements(By.TAG_NAME, "td")
-                            if len(cells) >= 6:
-                                date = cells[0].text.strip()
-                                time_info = cells[1].text.strip()
-                                vs_info = cells[2].text.strip()
-                                stadium = cells[3].text.strip()
-                                result = cells[4].text.strip()
+                            rows = table.find_elements(By.TAG_NAME, "tr")
+                            self.logger.info(f"테이블 {table_idx + 1}에서 {len(rows)}개 행 발견")
+                            
+                            for row_idx, row in enumerate(rows[1:], 1):  # 헤더 제외
+                                try:
+                                    cells = row.find_elements(By.TAG_NAME, "td")
+                                    if len(cells) >= 5:
+                                        date = cells[0].text.strip()
+                                        vs_info = cells[2].text.strip()
+                                        result = cells[4].text.strip()
+                                        stadium = cells[3].text.strip() if len(cells) > 3 else ''
+                                        
+                                        # 경기 결과가 있는 경우만 처리
+                                        if result and ':' in result and result != '-':
+                                            game_data = self.parse_game_info(date, vs_info, result, stadium)
+                                            if game_data:
+                                                all_games.extend(game_data)
+                                                self.logger.info(f"경기 데이터 추가: {date} {vs_info} {result}")
                                 
-                                # 경기 결과가 있는 경우만 처리
-                                if result and result != '-':
-                                    game_data = self.parse_game_info(date, vs_info, result, stadium)
-                                    if game_data:
-                                        all_games.extend(game_data)
+                                except Exception as row_error:
+                                    self.logger.warning(f"행 {row_idx} 처리 중 오류: {row_error}")
+                                    continue
                         
-                        except Exception as e:
-                            self.logger.warning(f"행 처리 중 오류: {e}")
+                        except Exception as table_error:
+                            self.logger.warning(f"테이블 {table_idx + 1} 처리 중 오류: {table_error}")
                             continue
                 
-                time.sleep(2)  # 서버 부하 방지
+                except Exception as month_error:
+                    self.logger.error(f"{current_month}월 데이터 수집 실패: {month_error}")
+                    continue
+                
+                time.sleep(3)  # 서버 부하 방지
         
         except Exception as e:
-            self.logger.error(f"데이터 수집 중 오류: {e}")
+            self.logger.error(f"Selenium 데이터 수집 중 전체 오류: {e}")
         
         finally:
-            driver.quit()
+            try:
+                driver.quit()
+            except:
+                pass
+        
+        if not all_games:
+            self.logger.warning("Selenium으로 데이터를 수집하지 못함. requests 방법 시도")
+            return self.get_game_data_requests(year)
         
         return all_games
     
@@ -183,10 +243,65 @@ class KBODataScraper:
             return None
     
     def get_game_data_requests(self, year=2025):
-        """requests를 사용한 대안 방법 (API가 있는 경우)"""
-        # KBO 사이트의 실제 API 엔드포인트를 찾아서 구현
-        # 현재는 Selenium 방법을 주로 사용
-        pass
+        """requests를 사용한 대안 방법"""
+        self.logger.info("requests를 사용하여 데이터 수집 시도")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.8,en-US;q=0.5,en;q=0.3',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        all_games = []
+        current_month = datetime.now().month
+        
+        try:
+            for month in range(3, current_month + 1):  # 3월부터 현재 월까지
+                self.logger.info(f"requests로 {year}년 {month}월 데이터 수집 중...")
+                
+                url = f"https://www.koreabaseball.com/Schedule/Schedule.aspx?year={year}&month={month:02d}"
+                
+                session = requests.Session()
+                response = session.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # 경기 일정 테이블 찾기
+                tables = soup.find_all('table', class_='tblType01')
+                
+                for table in tables:
+                    rows = table.find_all('tr')[1:]  # 헤더 제외
+                    
+                    for row in rows:
+                        try:
+                            cells = row.find_all('td')
+                            if len(cells) >= 5:
+                                date = cells[0].get_text(strip=True)
+                                vs_info = cells[2].get_text(strip=True)
+                                result = cells[4].get_text(strip=True)
+                                stadium = cells[3].get_text(strip=True) if len(cells) > 3 else ''
+                                
+                                # 경기 결과가 있는 경우만 처리
+                                if result and ':' in result and result != '-':
+                                    game_data = self.parse_game_info(date, vs_info, result, stadium)
+                                    if game_data:
+                                        all_games.extend(game_data)
+                        
+                        except Exception as e:
+                            self.logger.warning(f"행 처리 중 오류: {e}")
+                            continue
+                
+                time.sleep(1)  # 서버 부하 방지
+                
+        except Exception as e:
+            self.logger.error(f"requests 데이터 수집 중 오류: {e}")
+            return []
+        
+        return all_games
     
     def update_excel_file(self, games_data):
         """엑셀 파일 업데이트"""
@@ -242,44 +357,86 @@ class KBODataScraper:
         except Exception as e:
             self.logger.error(f"엑셀 파일 업데이트 실패: {e}")
     
+    def run_full_update(self):
+        """전체 시즌 데이터 업데이트"""
+        self.logger.info("=== KBO 데이터 전체 업데이트 시작 ===")
+        
+        try:
+            # 먼저 requests 방법 시도 (더 안정적)
+            self.logger.info("requests 방법으로 데이터 수집 시도")
+            all_games = self.get_game_data_requests()
+            
+            # requests 방법이 실패하면 Selenium 시도
+            if not all_games:
+                self.logger.info("requests 실패. Selenium 방법 시도")
+                all_games = self.get_game_data_selenium()
+            
+            if all_games:
+                self.logger.info(f"수집된 전체 경기 데이터: {len(all_games)}건")
+                self.update_excel_file(all_games)
+            else:
+                self.logger.warning("모든 방법으로 데이터 수집 실패")
+                
+        except Exception as e:
+            self.logger.error(f"전체 업데이트 실패: {e}")
+        
+        self.logger.info("=== KBO 데이터 전체 업데이트 완료 ===")
+    
     def run_daily_update(self):
         """일일 업데이트 실행"""
         self.logger.info("=== KBO 데이터 일일 업데이트 시작 ===")
         
         try:
-            # 현재 월의 데이터 수집
+            # 먼저 requests 방법 시도
             current_month = datetime.now().month
-            games_data = self.get_game_data_selenium(month=current_month)
+            self.logger.info("requests 방법으로 당월 데이터 수집 시도")
+            
+            # requests 방법으로 현재 월 데이터 수집
+            games_data = self.get_game_data_requests()
+            
+            # 실패하면 Selenium 시도
+            if not games_data:
+                self.logger.info("requests 실패. Selenium 방법 시도")
+                games_data = self.get_game_data_selenium(month=current_month)
             
             if games_data:
                 self.logger.info(f"수집된 경기 데이터: {len(games_data)}건")
                 self.update_excel_file(games_data)
             else:
-                self.logger.warning("수집된 데이터가 없습니다.")
+                self.logger.warning("모든 방법으로 데이터 수집 실패")
                 
         except Exception as e:
             self.logger.error(f"일일 업데이트 실패: {e}")
         
         self.logger.info("=== KBO 데이터 일일 업데이트 완료 ===")
     
-    def run_full_update(self):
-        """전체 시즌 데이터 업데이트"""
-        self.logger.info("=== KBO 데이터 전체 업데이트 시작 ===")
+    def test_connection(self):
+        """연결 테스트"""
+        self.logger.info("=== KBO 사이트 연결 테스트 ===")
         
+        # requests 테스트
         try:
-            # 3월부터 현재 월까지 모든 데이터 수집
-            all_games = self.get_game_data_selenium()
-            
-            if all_games:
-                self.logger.info(f"수집된 전체 경기 데이터: {len(all_games)}건")
-                self.update_excel_file(all_games)
-            else:
-                self.logger.warning("수집된 데이터가 없습니다.")
-                
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(self.base_url, headers=headers, timeout=10)
+            self.logger.info(f"requests 연결 성공: {response.status_code}")
         except Exception as e:
-            self.logger.error(f"전체 업데이트 실패: {e}")
+            self.logger.error(f"requests 연결 실패: {e}")
         
-        self.logger.info("=== KBO 데이터 전체 업데이트 완료 ===")
+        # Selenium 테스트
+        driver = self.setup_driver()
+        if driver:
+            try:
+                driver.get(self.base_url)
+                title = driver.title
+                self.logger.info(f"Selenium 연결 성공: {title}")
+            except Exception as e:
+                self.logger.error(f"Selenium 연결 실패: {e}")
+            finally:
+                driver.quit()
+        else:
+            self.logger.error("Selenium 드라이버 생성 실패")
     
     def start_scheduler(self):
         """스케줄러 시작"""
@@ -307,10 +464,11 @@ def main():
     print("1. 즉시 일일 업데이트 실행")
     print("2. 즉시 전체 업데이트 실행") 
     print("3. 자동 스케줄러 시작")
-    print("4. 종료")
+    print("4. 연결 테스트")
+    print("5. 종료")
     
     while True:
-        choice = input("\n선택하세요 (1-4): ").strip()
+        choice = input("\n선택하세요 (1-5): ").strip()
         
         if choice == '1':
             scraper.run_daily_update()
@@ -323,6 +481,8 @@ def main():
             except KeyboardInterrupt:
                 print("\n스케줄러가 중단되었습니다.")
         elif choice == '4':
+            scraper.test_connection()
+        elif choice == '5':
             print("프로그램을 종료합니다.")
             break
         else:
@@ -330,3 +490,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+scraper = KBODataScraper()
+scraper.run_daily_update()  # 오늘 경기 업데이트
+scraper.run_full_update()   # 전체 시즌 업데이트
